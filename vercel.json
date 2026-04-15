@@ -1,10 +1,6 @@
 {
-  "functions": {
-    "src/index.ts": {
-      "runtime": "edge"
-    }
-  },
-  "routes": [
-    { "src": "/(.*)", "dest": "/src/index.ts" }
+  "rewrites": [
+    { "source": "/v1/(.*)", "destination": "/src/index.ts" },
+    { "source": "/", "destination": "/src/index.ts" }
   ]
 }
