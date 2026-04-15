@@ -6,6 +6,7 @@ OpenAI-compatible proxy for Nvidia API with automatic key rotation on 429 errors
 
 - ✅ OpenAI-compatible API proxy
 - ✅ Automatic key rotation on 429 (circular)
+- ✅ **Keep-Alive Stream Relay** - prevents gateway timeouts
 - ✅ Streaming support (SSE)
 - ✅ HTTP/2 ready (on supported platforms)
 - ✅ CORS enabled
@@ -67,6 +68,62 @@ EXPOSE 3091
 CMD ["bun", "run", "src/index.ts"]
 ```
 
+## Keep-Alive Stream Relay
+
+**Problem**: Serverless platforms (Vercel, Cloudflare Workers) have strict timeout limits. Long-running AI requests get killed before completion.
+
+**Solution**: The Keep-Alive Stream Relay tricks the gateway into thinking the request is moving, even while the model is "thinking."
+
+### How It Works
+
+| Phase | What Happens |
+|-------|--------------|
+| **1. Immediate Flush** | Return HTTP 200 and send headers immediately. This resets the "Initial Response" timer in the gateway. |
+| **2. Forced Streaming** | Always request streaming from upstream, even if client wants JSON. |
+| **3. Synthetic Heartbeat** | Send invisible SSE comments (`: keep-alive`) every 3 seconds while waiting for first chunk. Keeps TCP connection "hot". |
+| **4. Buffer Re-assembly** | If client wanted JSON, collect all stream chunks internally and send final JSON at the end. |
+
+### Protocol Details
+
+```
+Client Request → Proxy
+                    ↓
+         [Immediate 200 OK + Headers]
+                    ↓
+         [Heartbeat every 3s: ": keep-alive"]
+                    ↓
+         [First AI chunk arrives]
+                    ↓
+         [Stop heartbeat, stream data]
+                    ↓
+         [Stream complete]
+                    ↓
+         If JSON client → Re-assemble and send final JSON
+         If Stream client → Already sent, just close
+```
+
+### Why This Works
+
+| Gateway Limitation | Keep-Alive Solution |
+|--------------------|---------------------|
+| "Initial response must arrive within 10s" | Headers sent immediately |
+| "Connection idle for 5s = timeout" | Heartbeat every 3s |
+| "Total request time max 60s" | Can extend with ongoing data |
+
+### Invisible Heartbeat
+
+The heartbeat uses SSE comments which are ignored by clients:
+
+```
+: keep-alive
+
+: keep-alive
+
+data: {"id":"real-data"...}
+```
+
+Clients parsing SSE will skip the `:` lines as comments, so the heartbeat is invisible.
+
 ## Usage
 
 | Setting | Value |
@@ -105,6 +162,12 @@ const API_KEYS: string[] = [
 ]
 ```
 
+Adjust heartbeat timing:
+
+```typescript
+const HEARTBEAT_INTERVAL_MS = 3000  // 3 seconds (default)
+```
+
 ## Key Rotation Logic
 
 1. Request sent with current key (starts at key 1)
@@ -114,16 +177,16 @@ const API_KEYS: string[] = [
 
 ## Platform Comparison
 
-| Platform | Free Tier | Persistence | HTTP/2 | Notes |
-|----------|-----------|-------------|--------|-------|
-| **Cloudflare Workers** | ✅ 100k req/day | KV (paid) | ✅ | Best free option |
-| **Vercel Edge** | ✅ 100GB bandwidth | Edge Config | ✅ | Easy deploy |
-| **Bun (VPS)** | ❌ | In-memory | ✅ | Full control |
-| **Fly.io** | ✅ 3 VMs | Volume | ✅ | Docker-based |
+| Platform | Free Tier | Persistence | HTTP/2 | Max Timeout | Notes |
+|----------|-----------|-------------|--------|-------------|-------|
+| **Cloudflare Workers** | ✅ 100k req/day | KV (paid) | ✅ | 30s CPU | Best free option |
+| **Vercel Edge** | ✅ 100GB bandwidth | Edge Config | ✅ | 60s | Easy deploy |
+| **Bun (VPS)** | ❌ | In-memory | ✅ | Unlimited | Full control |
+| **Fly.io** | ✅ 3 VMs | Volume | ✅ | Unlimited | Docker-based |
 
 ## Files
 
-- `src/index.ts` - Main proxy server
+- `src/index.ts` - Main proxy server with keep-alive relay
 - `wrangler.toml` - Cloudflare Workers config
 - `vercel.json` - Vercel Edge config
 
