@@ -1,0 +1,19 @@
+{
+  "name": "nvidia-key-proxy-ts",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "bun run src/index.ts",
+    "dev": "bun --watch run src/index.ts",
+    "deploy:cf": "wrangler deploy",
+    "deploy:vercel": "vercel --prod"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "hono": "^4.12.14"
+  }
+}

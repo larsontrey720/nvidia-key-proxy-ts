@@ -1,0 +1,10 @@
+name = "nvidia-key-proxy"
+main = "src/index.ts"
+compatibility_date = "2024-01-01"
+
+[vars]
+# API keys are hardcoded in the source for simplicity
+# For production, use secrets: wrangler secret put API_KEYS
+
+[observability]
+enabled = true
