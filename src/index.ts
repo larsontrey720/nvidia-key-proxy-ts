@@ -11,8 +11,8 @@ const BASE_URL = 'https://integrate.api.nvidia.com'
 
 // Add your API keys here
 const API_KEYS: string[] = [
-  'nvapi-YOUR_KEY_HERE',
-  'nvapi-YOUR_KEY_HERE',
+  'YOUR_KEY_1',
+  'YOUR_KEY_2',
 ]
 
 const HEARTBEAT_INTERVAL_MS = 3000
