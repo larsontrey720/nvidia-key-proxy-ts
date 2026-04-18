@@ -9,11 +9,15 @@ import { cors } from 'hono/cors'
 
 const BASE_URL = 'https://integrate.api.nvidia.com'
 
-// Add your API keys here
-const API_KEYS: string[] = [
-  'YOUR_KEY_1',
-  'YOUR_KEY_2',
-]
+// API keys from environment variable (comma-separated) or hardcoded fallback
+// Set NVIDIA_API_KEYS in Vercel Environment Variables: nvapi-key1,nvapi-key2,nvapi-key3
+const API_KEYS: string[] = (process.env.NVIDIA_API_KEYS?.split(',').map(k => k.trim()).filter(Boolean) || [
+  // Fallback keys (remove before deploying to production)
+]).filter(k => k.length > 0)
+
+if (API_KEYS.length === 0) {
+  console.error('[PROXY] ERROR: No API keys configured! Set NVIDIA_API_KEYS env var.')
+}
 
 const HEARTBEAT_INTERVAL_MS = 3000
 const HEARTBEAT_BYTE = ': keep-alive\n\n'
