@@ -130,29 +130,23 @@ app.all('/v1/*', async (c) => {
       if (!reader) return c.text('No body', 500)
       
       if (clientWantsStream) {
+        // Pure streaming - no heartbeat interference
         return new Response(
           new ReadableStream({
             async start(controller) {
-              const encoder = new TextEncoder()
               let totalBytes = 0
               let chunkCount = 0
-              let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-              
-              heartbeatTimer = setInterval(() => controller.enqueue(encoder.encode(HEARTBEAT_BYTE)), HEARTBEAT_INTERVAL_MS)
               
               try {
                 while (true) {
                   const { done, value } = await reader.read()
                   if (done) break
-                  
                   controller.enqueue(value)
                   totalBytes += value.length
                   chunkCount++
                 }
-                
                 console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks)`)
               } finally {
-                if (heartbeatTimer) clearInterval(heartbeatTimer)
                 controller.close()
               }
             }
