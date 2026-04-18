@@ -68,7 +68,18 @@ app.all('/v1/*', async (c) => {
     triedKeys.add(currentIdx)
     
     try {
+      // Clone body and add model-specific params
       const modifiedBody = { ...requestBody, stream: true }
+      
+      // For z-ai/glm4.7, ensure chat_template_kwargs is set for clean output
+      if (modifiedBody.model === 'z-ai/glm4.7' && !modifiedBody.chat_template_kwargs) {
+        modifiedBody.chat_template_kwargs = {
+          enable_thinking: false,
+          clear_thinking: true
+        }
+        console.log(`[PROXY] Added chat_template_kwargs for z-ai/glm4.7`)
+      }
+      
       const bodyString = JSON.stringify(modifiedBody)
       
       const headers = buildHeaders(currentIdx)
