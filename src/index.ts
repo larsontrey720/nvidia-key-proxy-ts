@@ -159,6 +159,7 @@ app.all('/v1/*', async (c) => {
         
         const fullSSE = chunks.join('')
         const messages: string[] = []
+        const reasoningParts: string[] = []
         
         for (const line of fullSSE.split('\n')) {
           if (line.startsWith('data: ')) {
@@ -166,21 +167,33 @@ app.all('/v1/*', async (c) => {
             if (data === '[DONE]') continue
             try {
               const parsed = JSON.parse(data)
-              if (parsed.choices?.[0]?.delta?.content) {
-                messages.push(parsed.choices[0].delta.content)
+              const delta = parsed.choices?.[0]?.delta
+              if (delta) {
+                // Handle both content and reasoning_content (for reasoning models like z-ai/glm4.7)
+                if (delta.content) {
+                  messages.push(delta.content)
+                }
+                if (delta.reasoning_content) {
+                  reasoningParts.push(delta.reasoning_content)
+                }
               }
             } catch {}
           }
         }
         
-        const finalJson = {
+        // Build final JSON - include reasoning_content if present
+        const finalJson: any = {
           id: `chatcmpl-${Date.now()}`,
           object: 'chat.completion',
           created: Math.floor(Date.now() / 1000),
           model: requestBody.model || 'unknown',
           choices: [{
             index: 0,
-            message: { role: 'assistant', content: messages.join('') },
+            message: { 
+              role: 'assistant', 
+              content: messages.join(''),
+              ...(reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
+            },
             finish_reason: 'stop'
           }],
           usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
