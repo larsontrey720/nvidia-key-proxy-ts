@@ -201,6 +201,7 @@ app.all('/v1/*', async (c) => {
                 const delta = parsed.choices?.[0]?.delta
                 if (delta) {
                   if (delta.content) messages.push(delta.content)
+                  if (delta.reasoning) reasoningParts.push(delta.reasoning)
                   if (delta.reasoning_content) reasoningParts.push(delta.reasoning_content)
                 }
               } catch {}
