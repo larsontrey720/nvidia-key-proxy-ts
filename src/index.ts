@@ -130,7 +130,7 @@ app.all('/v1/*', async (c) => {
       if (!reader) return c.text('No body', 500)
       
       if (clientWantsStream) {
-        // Pure streaming - no heartbeat interference
+        // Pure streaming - forward chunks as-is from Nvidia
         return new Response(
           new ReadableStream({
             async start(controller) {
@@ -145,7 +145,9 @@ app.all('/v1/*', async (c) => {
                   totalBytes += value.length
                   chunkCount++
                 }
-                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks)`)
+                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
+              } catch (e) {
+                console.error(`[PROXY] Stream error: ${e}`)
               } finally {
                 controller.close()
               }
@@ -156,6 +158,8 @@ app.all('/v1/*', async (c) => {
             headers: {
               'Content-Type': 'text/event-stream',
               'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'X-Accel-Buffering': 'no',
               'Access-Control-Allow-Origin': '*',
             }
           }
