@@ -128,9 +128,23 @@ Clients parsing SSE will skip the `:` lines as comments, so the heartbeat is inv
 
 | Setting | Value |
 |---------|-------|
-| **Base URL** | `https://your-deployment-url/v1` |
+| **Base URL** | `https://nvidia-key-rotation-proxy-ts.vercel.app/v1` |
 | **API Key** | Any string (e.g., `sk-test`) |
 | **Model** | Any Nvidia model |
+
+### ⚠️ Important: Use Streaming for Long Responses
+
+**Vercel Edge has a 25-second execution limit.** For long responses (coding sessions, essays, etc.), use `stream: true`:
+
+```json
+{
+  "model": "z-ai/glm4.7",
+  "messages": [...],
+  "stream": true  // ← Required for long responses
+}
+```
+
+Non-streaming responses work fine for short queries but may be cut off for long outputs due to Vercel's timeout.
 
 ### Non-streaming
 
