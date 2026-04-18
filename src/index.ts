@@ -53,7 +53,7 @@ app.all('/v1/*', async (c) => {
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
   // Fix for z-ai/glm models that need higher max_tokens
-  if (!requestBody.max_tokens && requestBody.model?.startsWith('z-ai/')) {
+  if (!requestBody.max_tokens) {
     requestBody.max_tokens = 16384
   }
   
