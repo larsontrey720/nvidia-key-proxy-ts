@@ -137,21 +137,13 @@ app.all('/v1/*', async (c) => {
               let totalBytes = 0
               let chunkCount = 0
               let heartbeatTimer: ReturnType<typeof setInterval> | null = null
-              let firstChunk = false
               
-              heartbeatTimer = setInterval(() => {
-                if (!firstChunk) controller.enqueue(encoder.encode(HEARTBEAT_BYTE))
-              }, HEARTBEAT_INTERVAL_MS)
+              heartbeatTimer = setInterval(() => controller.enqueue(encoder.encode(HEARTBEAT_BYTE)), HEARTBEAT_INTERVAL_MS)
               
               try {
                 while (true) {
                   const { done, value } = await reader.read()
                   if (done) break
-                  
-                  if (!firstChunk) {
-                    firstChunk = true
-                    if (heartbeatTimer) clearInterval(heartbeatTimer)
-                  }
                   
                   controller.enqueue(value)
                   totalBytes += value.length
