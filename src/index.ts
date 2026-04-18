@@ -80,6 +80,14 @@ app.all('/v1/*', async (c) => {
       // Clone body and add model-specific params
       const modifiedBody = { ...requestBody, stream: true }
       
+      // Add default temperature and top_p if not provided
+      if (modifiedBody.temperature === undefined) {
+        modifiedBody.temperature = 0.7
+      }
+      if (modifiedBody.top_p === undefined) {
+        modifiedBody.top_p = 1.0
+      }
+      
       // For z-ai/glm4.7, ensure chat_template_kwargs is set for clean output
       if (modifiedBody.model === 'z-ai/glm4.7' && !modifiedBody.chat_template_kwargs) {
         modifiedBody.chat_template_kwargs = {
