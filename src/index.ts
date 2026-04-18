@@ -158,60 +158,98 @@ app.all('/v1/*', async (c) => {
           }
         )
       } else {
-        // JSON reassembly
-        const chunks: string[] = []
-        const decoder = new TextDecoder()
+        // JSON reassembly with heartbeat (prevents Vercel timeout)
         
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-          chunks.push(decoder.decode(value, { stream: true }))
-        }
-        
-        const fullSSE = chunks.join('')
-        const messages: string[] = []
-        const reasoningParts: string[] = []
-        
-        for (const line of fullSSE.split('\n')) {
-          if (line.startsWith('data: ')) {
-            const data = line.slice(6).trim()
-            if (data === '[DONE]') continue
-            try {
-              const parsed = JSON.parse(data)
-              const delta = parsed.choices?.[0]?.delta
-              if (delta) {
-                // Handle both content and reasoning_content (for reasoning models like z-ai/glm4.7)
-                if (delta.content) {
-                  messages.push(delta.content)
+        return new Response(
+          new ReadableStream({
+            async start(controller) {
+              const encoder = new TextEncoder()
+              const decoder = new TextDecoder()
+              const chunks: string[] = []
+              let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+              let firstChunk = false
+              let totalBytes = 0
+              
+              // Send heartbeat every 3 seconds
+              heartbeatTimer = setInterval(() => {
+                if (!firstChunk) {
+                  controller.enqueue(encoder.encode(': keep-alive\n\n'))
                 }
-                if (delta.reasoning_content) {
-                  reasoningParts.push(delta.reasoning_content)
+              }, 3000)
+              
+              try {
+                while (true) {
+                  const { done, value } = await reader.read()
+                  if (done) break
+                  
+                  if (!firstChunk) {
+                    firstChunk = true
+                    if (heartbeatTimer) clearInterval(heartbeatTimer)
+                  }
+                  
+                  chunks.push(decoder.decode(value, { stream: true }))
+                  totalBytes += value.length
                 }
+                
+                const fullSSE = chunks.join('')
+                const messages: string[] = []
+                const reasoningParts: string[] = []
+                
+                for (const line of fullSSE.split('\n')) {
+                  if (line.startsWith('data: ')) {
+                    const data = line.slice(6).trim()
+                    if (data === '[DONE]') continue
+                    try {
+                      const parsed = JSON.parse(data)
+                      const delta = parsed.choices?.[0]?.delta
+                      if (delta) {
+                        if (delta.content) messages.push(delta.content)
+                        if (delta.reasoning_content) reasoningParts.push(delta.reasoning_content)
+                      }
+                    } catch {}
+                  }
+                }
+                
+                const finalJson: any = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model: requestBody.model || 'unknown',
+                  choices: [{
+                    index: 0,
+                    message: { 
+                      role: 'assistant', 
+                      content: messages.join(''),
+                      ...(reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
+                    },
+                    finish_reason: 'stop'
+                  }],
+                  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                }
+                
+                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, re-assembled ${totalBytes} bytes)`)
+                
+                // Send as final SSE chunk
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalJson)}\n\n`))
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+                
+              } catch (e) {
+                console.error(`[PROXY] Re-assembly error: ${e}`)
+                if (heartbeatTimer) clearInterval(heartbeatTimer)
+              } finally {
+                controller.close()
               }
-            } catch {}
+            }
+          }),
+          {
+            status: response.status,
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Access-Control-Allow-Origin': '*',
+            }
           }
-        }
-        
-        // Build final JSON - include reasoning_content if present
-        const finalJson: any = {
-          id: `chatcmpl-${Date.now()}`,
-          object: 'chat.completion',
-          created: Math.floor(Date.now() / 1000),
-          model: requestBody.model || 'unknown',
-          choices: [{
-            index: 0,
-            message: { 
-              role: 'assistant', 
-              content: messages.join(''),
-              ...(reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
-            },
-            finish_reason: 'stop'
-          }],
-          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-        }
-        
-        console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, re-assembled)`)
-        return c.json(finalJson)
+        )
       }
       
     } catch (error) {
