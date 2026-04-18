@@ -48,15 +48,12 @@ app.all('/v1/*', async (c) => {
   
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
-  const clientWantsStream = requestBody.stream === true
-  
-  // Set default max_tokens for models with low defaults (z-ai/glm4.7 defaults to ~32 tokens!)
-  if (!requestBody.max_tokens) {
-    const model = requestBody.model || ''
-    if (model.includes('z-ai/glm') || model.includes('glm4') || model.includes('reasoning')) {
-      requestBody.max_tokens = 4096  // Reasonable default for reasoning models
-    }
+  // Fix for z-ai/glm models that need higher max_tokens
+  if (!requestBody.max_tokens && requestBody.model?.startsWith('z-ai/')) {
+    requestBody.max_tokens = 16384
   }
+  
+  const clientWantsStream = requestBody.stream === true
   
   const buildHeaders = (keyIndex: number): Headers => {
     const headers = new Headers()
