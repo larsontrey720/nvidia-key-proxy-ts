@@ -54,7 +54,7 @@ app.all('/v1/*', async (c) => {
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
   // Fix for z-ai/glm models that need higher max_tokens
   if (!requestBody.max_tokens) {
-    requestBody.max_tokens = 16384
+    requestBody.max_tokens = 32768
   }
   
   const clientWantsStream = requestBody.stream === true
