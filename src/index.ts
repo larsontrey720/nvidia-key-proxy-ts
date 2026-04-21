@@ -197,7 +197,17 @@ app.all('/v1/*', async (c) => {
                 const parsed = JSON.parse(data)
                 const delta = parsed.choices?.[0]?.delta
                 if (delta) {
-                  if (delta.content) messages.push(delta.content)
+                  if (delta.content) {
+                    messages.push(delta.content)
+                  } else if (delta.reasoning_content) {
+                    reasoningParts.push(delta.reasoning_content)
+                  }
+                }
+              } catch (e) {
+                // Skip malformed lines
+              }
+            }
+          }
           
           const finalJson = {
             id: `chatcmpl-${Date.now()}`,
