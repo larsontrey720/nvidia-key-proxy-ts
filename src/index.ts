@@ -96,6 +96,13 @@ app.all('/v1/*', async (c) => {
         }
         console.log(`[PROXY] Added chat_template_kwargs for z-ai/glm4.7`)
       }
+
+      // For moonshotai/kimi-k2.5, disable thinking to prevent token budget issues
+      // Without this, internal reasoning consumes most of max_tokens, truncating visible output
+      if (modifiedBody.model === 'moonshotai/kimi-k2.5' && !modifiedBody.chat_template_kwargs) {
+        modifiedBody.chat_template_kwargs = { thinking: false }
+        console.log(`[PROXY] Added chat_template_kwargs for moonshotai/kimi-k2.5 (thinking disabled)`)
+      }
       
       const bodyString = JSON.stringify(modifiedBody)
       
