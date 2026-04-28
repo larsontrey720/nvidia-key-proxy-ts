@@ -81,7 +81,7 @@ app.all('/v1/*', async (c) => {
       const modifiedBody = { ...requestBody, stream: true }
       
       // ALWAYS use these values (override client)
-      modifiedBody.temperature = 0.7
+      modifiedBody.temperature = 0.75
       modifiedBody.top_p = 1.0
       
       // For z-ai/glm4.7, ensure chat_template_kwargs is set for clean output
