@@ -73,8 +73,8 @@ app.all('/v1/*', async (c) => {
     try {
       const modifiedBody = { ...requestBody, stream: true }
       
-      modifiedBody.temperature = 0.75
-      modifiedBody.top_p = 1.0
+      modifiedBody.temperature = 1.0
+      modifiedBody.top_p = 0.95
       
       if (modifiedBody.model === 'z-ai/glm4.7' && !modifiedBody.chat_template_kwargs) {
         modifiedBody.chat_template_kwargs = {
