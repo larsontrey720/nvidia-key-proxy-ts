@@ -150,6 +150,12 @@ app.all('/v1/*', async (c) => {
                           if (delta && 'reasoning' in delta) {
                             delete delta.reasoning
                           }
+                          // Strip <think>...</think> tags from content field
+                          // stepfun embeds these in content alongside reasoning_content
+                          if (delta?.content && typeof delta.content === 'string') {
+                            delta.content = delta.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+                            if (delta.content === '') delta.content = null
+                          }
                           normalizedLines.push('data: ' + JSON.stringify(data))
                         } catch {
                           normalizedLines.push(line)
