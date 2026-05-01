@@ -9,18 +9,12 @@ import { cors } from 'hono/cors'
 
 const BASE_URL = 'https://integrate.api.nvidia.com'
 
-// API keys from environment variable (comma-separated) or hardcoded fallback
-// Set NVIDIA_API_KEYS in Vercel Environment Variables: nvapi-key1,nvapi-key2,nvapi-key3
 const API_KEYS: string[] = (process.env.NVIDIA_API_KEYS?.split(',').map(k => k.trim()).filter(Boolean) || [
-  // Fallback keys (remove before deploying to production)
 ]).filter(k => k.length > 0)
 
 if (API_KEYS.length === 0) {
   console.error('[PROXY] ERROR: No API keys configured! Set NVIDIA_API_KEYS env var.')
 }
-
-const HEARTBEAT_INTERVAL_MS = 3000
-const HEARTBEAT_BYTE = ': keep-alive\n\n'
 
 let currentKeyIndex = 0
 let totalRequests = 0
@@ -52,7 +46,7 @@ app.all('/v1/*', async (c) => {
   
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
-  // Fix for z-ai/glm models that need higher max_tokens
+  
   if (!requestBody.max_tokens) {
     requestBody.max_tokens = 32768
   }
@@ -77,14 +71,11 @@ app.all('/v1/*', async (c) => {
     triedKeys.add(currentIdx)
     
     try {
-      // Clone body and add model-specific params
       const modifiedBody = { ...requestBody, stream: true }
       
-      // ALWAYS use these values (override client)
       modifiedBody.temperature = 0.75
       modifiedBody.top_p = 1.0
       
-      // For z-ai/glm4.7, ensure chat_template_kwargs is set for clean output
       if (modifiedBody.model === 'z-ai/glm4.7' && !modifiedBody.chat_template_kwargs) {
         modifiedBody.chat_template_kwargs = {
           enable_thinking: false,
@@ -93,8 +84,6 @@ app.all('/v1/*', async (c) => {
         console.log(`[PROXY] Added chat_template_kwargs for z-ai/glm4.7`)
       }
 
-      // For moonshotai/kimi-k2.5, disable thinking to prevent token budget issues
-      // Without this, internal reasoning consumes most of max_tokens, truncating visible output
       if (modifiedBody.model === 'moonshotai/kimi-k2.5' && !modifiedBody.chat_template_kwargs) {
         modifiedBody.chat_template_kwargs = { thinking: false }
         console.log(`[PROXY] Added chat_template_kwargs for moonshotai/kimi-k2.5 (thinking disabled)`)
@@ -133,77 +122,71 @@ app.all('/v1/*', async (c) => {
       if (!reader) return c.text('No body', 500)
       
       if (clientWantsStream) {
-      // Streaming - normalize reasoning fields for consistent client parsing
-      // Strip duplicate 'reasoning' field from stepfun models, keep only 'reasoning_content'
-      const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
-      
-      return new Response(
-        new ReadableStream({
-          async start(controller) {
-            const encoder = new TextEncoder()
-            const decoder = new TextDecoder()
-            let totalBytes = 0
-            let chunkCount = 0
-            
-            try {
-              while (true) {
-                const { done, value } = await reader.read()
-                if (done) break
-                
-                if (needsNormalization) {
-                  // Parse SSE, strip 'reasoning' field, keep 'reasoning_content' only
-                  const text = decoder.decode(value, { stream: true })
-                  const lines = text.split('\n')
-                  const normalizedLines: string[] = []
+        const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
+        
+        return new Response(
+          new ReadableStream({
+            async start(controller) {
+              const encoder = new TextEncoder()
+              const decoder = new TextDecoder()
+              let totalBytes = 0
+              let chunkCount = 0
+              
+              try {
+                while (true) {
+                  const { done, value } = await reader.read()
+                  if (done) break
                   
-                  for (const line of lines) {
-                    if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-                      try {
-                        const data = JSON.parse(line.slice(6))
-                        const delta = data.choices?.[0]?.delta
-                        if (delta && 'reasoning' in delta) {
-                          delete delta.reasoning
+                  if (needsNormalization) {
+                    const text = decoder.decode(value, { stream: true })
+                    const lines = text.split('\n')
+                    const normalizedLines: string[] = []
+                    
+                    for (const line of lines) {
+                      if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                        try {
+                          const data = JSON.parse(line.slice(6))
+                          const delta = data.choices?.[0]?.delta
+                          if (delta && 'reasoning' in delta) {
+                            delete delta.reasoning
+                          }
+                          normalizedLines.push('data: ' + JSON.stringify(data))
+                        } catch {
+                          normalizedLines.push(line)
                         }
-                        normalizedLines.push('data: ' + JSON.stringify(data))
-                      } catch {
+                      } else {
                         normalizedLines.push(line)
                       }
-                    } else {
-                      normalizedLines.push(line)
                     }
+                    const normalized = normalizedLines.join('\n')
+                    controller.enqueue(encoder.encode(normalized))
+                    totalBytes += normalized.length
+                  } else {
+                    controller.enqueue(value)
+                    totalBytes += value.length
                   }
-                  const normalized = normalizedLines.join('\n')
-                  controller.enqueue(encoder.encode(normalized))
-                  totalBytes += normalized.length
-                } else {
-                  controller.enqueue(value)
-                  totalBytes += value.length
+                  chunkCount++
                 }
-                chunkCount++
+                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
+              } catch (e) {
+                console.error(`[PROXY] Stream error: ${e}`)
+              } finally {
+                controller.close()
               }
-              console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
-            } catch (e) {
-              console.error(`[PROXY] Stream error: ${e}`)
-            } finally {
-              controller.close()
+            }
+          }),
+          {
+            status: response.status,
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'X-Accel-Buffering': 'no',
+              'Access-Control-Allow-Origin': '*',
             }
           }
-        }),
-        {
-          status: response.status,
-          headers: {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'X-Accel-Buffering': 'no',
-            'Access-Control-Allow-Origin': '*',
-          }
-        }
-      )
-
         )
       } else {
-        // JSON reassembly - collect all data then return as JSON
         const chunks: string[] = []
         const decoder = new TextDecoder()
         let totalBytes = 0
@@ -234,7 +217,7 @@ app.all('/v1/*', async (c) => {
                     reasoningParts.push(delta.reasoning_content)
                   }
                 }
-              } catch (e) {
+              } catch {
                 // Skip malformed lines
               }
             }
@@ -273,5 +256,4 @@ app.all('/v1/*', async (c) => {
   }
 })
 
-// Export for Vercel Edge
 export default app
