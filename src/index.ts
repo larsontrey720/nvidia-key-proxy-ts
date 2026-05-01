@@ -133,39 +133,74 @@ app.all('/v1/*', async (c) => {
       if (!reader) return c.text('No body', 500)
       
       if (clientWantsStream) {
-        // Pure streaming - forward chunks as-is from Nvidia
-        return new Response(
-          new ReadableStream({
-            async start(controller) {
-              let totalBytes = 0
-              let chunkCount = 0
-              
-              try {
-                while (true) {
-                  const { done, value } = await reader.read()
-                  if (done) break
+      // Streaming - normalize reasoning fields for consistent client parsing
+      // Strip duplicate 'reasoning' field from stepfun models, keep only 'reasoning_content'
+      const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
+      
+      return new Response(
+        new ReadableStream({
+          async start(controller) {
+            const encoder = new TextEncoder()
+            const decoder = new TextDecoder()
+            let totalBytes = 0
+            let chunkCount = 0
+            
+            try {
+              while (true) {
+                const { done, value } = await reader.read()
+                if (done) break
+                
+                if (needsNormalization) {
+                  // Parse SSE, strip 'reasoning' field, keep 'reasoning_content' only
+                  const text = decoder.decode(value, { stream: true })
+                  const lines = text.split('\n')
+                  const normalizedLines: string[] = []
+                  
+                  for (const line of lines) {
+                    if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                      try {
+                        const data = JSON.parse(line.slice(6))
+                        const delta = data.choices?.[0]?.delta
+                        if (delta && 'reasoning' in delta) {
+                          delete delta.reasoning
+                        }
+                        normalizedLines.push('data: ' + JSON.stringify(data))
+                      } catch {
+                        normalizedLines.push(line)
+                      }
+                    } else {
+                      normalizedLines.push(line)
+                    }
+                  }
+                  const normalized = normalizedLines.join('\n')
+                  controller.enqueue(encoder.encode(normalized))
+                  totalBytes += normalized.length
+                } else {
                   controller.enqueue(value)
                   totalBytes += value.length
-                  chunkCount++
                 }
-                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
-              } catch (e) {
-                console.error(`[PROXY] Stream error: ${e}`)
-              } finally {
-                controller.close()
+                chunkCount++
               }
-            }
-          }),
-          {
-            status: response.status,
-            headers: {
-              'Content-Type': 'text/event-stream',
-              'Cache-Control': 'no-cache',
-              'Connection': 'keep-alive',
-              'X-Accel-Buffering': 'no',
-              'Access-Control-Allow-Origin': '*',
+              console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
+            } catch (e) {
+              console.error(`[PROXY] Stream error: ${e}`)
+            } finally {
+              controller.close()
             }
           }
+        }),
+        {
+          status: response.status,
+          headers: {
+            'Content-Type': 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'Connection': 'keep-alive',
+            'X-Accel-Buffering': 'no',
+            'Access-Control-Allow-Origin': '*',
+          }
+        }
+      )
+
         )
       } else {
         // JSON reassembly - collect all data then return as JSON
