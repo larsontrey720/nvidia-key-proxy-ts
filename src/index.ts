@@ -1,4 +1,13 @@
 /**
+ * Determine whether to include reasoning_content in the response.
+ * Default: OFF (most clients don't know this field and mangle it into content).
+ * Opt-in: client passes `reasoning_format: "raw"` to receive it.
+ */
+function clientWantsReasoning(body: any): boolean {
+  return body.reasoning_format === 'raw'
+}
+
+/**
  * Nvidia API Key Rotation Proxy - TypeScript/Hono
  * 
  * Deployable to: Bun, Cloudflare Workers, Vercel Edge
@@ -173,8 +182,8 @@ app.all('/v1/*', async (c) => {
       if (clientWantsStream) {
         const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
 
-        // Check if client wants reasoning stripped
-        const stripReasoning = requestBody.reasoning_format === 'none'
+        // Check if client explicitly wants reasoning_content in response
+        const includeReasoning = clientWantsReasoning(requestBody)
 
         return new Response(
           new ReadableStream({
@@ -189,7 +198,7 @@ app.all('/v1/*', async (c) => {
                   const { done, value } = await reader.read()
                   if (done) break
 
-                  if (needsNormalization || stripReasoning) {
+                  if (needsNormalization || !includeReasoning) {
                     const text = decoder.decode(value, { stream: true })
                     const lines = text.split('\n')
                     const normalizedLines: string[] = []
@@ -212,8 +221,9 @@ app.all('/v1/*', async (c) => {
                               if (delta.content === '') delta.content = null
                             }
 
-                            // If stripReasoning, also strip reasoning_content from stream
-                            if (stripReasoning && delta?.reasoning_content) {
+                            // Strip reasoning_content from stream by default
+                            // Only pass through when client opts in with reasoning_format: "raw"
+                            if (!includeReasoning && delta?.reasoning_content) {
                               delta.reasoning_content = null
                             }
                           }
@@ -293,8 +303,8 @@ app.all('/v1/*', async (c) => {
 
           // Patch 2: Strip reasoning patterns from content in non-streaming re-assembly
           const rawContent = messages.join('')
-          const stripReasoningNonStream = requestBody.reasoning_format === 'none'
-          const finalContent = stripReasoningFromContent(rawContent, stripReasoningNonStream)
+          const includeReasoningNonStream = clientWantsReasoning(requestBody)
+          const finalContent = stripReasoningFromContent(rawContent, !includeReasoningNonStream)
 
           const finalJson = {
             id: `chatcmpl-${Date.now()}`,
@@ -306,7 +316,7 @@ app.all('/v1/*', async (c) => {
               message: {
                 role: 'assistant',
                 content: finalContent,
-                ...(!stripReasoningNonStream && reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
+                ...(includeReasoningNonStream && reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
               },
               finish_reason: 'stop'
             }],
