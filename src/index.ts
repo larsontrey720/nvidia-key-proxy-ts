@@ -257,14 +257,32 @@ app.all('/v1/*', async (c) => {
           // Patch 2: Strip reasoning patterns from content in non-streaming re-assembly
           let finalContent = messages.join('')
 
-          // Strip **Step X:** patterns and content between them
-          finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
-          // Strip **Conclusion:** patterns
-          finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
-          // Strip any remaining markdown reasoning patterns
-          finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
-          finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
-          finalContent = finalContent.trim()
+          // Check if client wants reasoning stripped
+          const stripReasoningNonStream = requestBody.reasoning_format === 'none'
+
+          if (stripReasoningNonStream) {
+            // When reasoning_format=none, strip ALL reasoning patterns and keep only final answer
+            // Strip numbered steps: "1. ...", "2. ..." (reasoning steps)
+            finalContent = finalContent.replace(/^\s*\d+\.\s+.*$/gm, '')
+            // Strip **Step X:** patterns and content between them
+            finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
+            // Strip **Conclusion:** patterns
+            finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
+            // Strip any remaining markdown reasoning patterns
+            finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
+            finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
+            // Strip "Step-by-step reasoning:" headers
+            finalContent = finalContent.replace(/^Step-by-step reasoning:\s*$/gm, '')
+            // Clean up excessive newlines
+            finalContent = finalContent.replace(/\n{3,}/g, '\n\n').trim()
+          } else {
+            // Default: strip **Step X:** patterns but keep the final answer
+            finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
+            finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
+            finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
+            finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
+            finalContent = finalContent.trim()
+          }
 
           const finalJson = {
             id: `chatcmpl-${Date.now()}`,
@@ -276,7 +294,7 @@ app.all('/v1/*', async (c) => {
               message: {
                 role: 'assistant',
                 content: finalContent,
-                ...(reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
+                ...(!stripReasoningNonStream && reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
               },
               finish_reason: 'stop'
             }],
