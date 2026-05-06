@@ -46,7 +46,19 @@ app.all('/v1/*', async (c) => {
   
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
-  
+
+  // Patch 1: Strip reasoning_content from assistant messages before forwarding
+  // This prevents reasoning leakage across turns
+  if (requestBody.messages && Array.isArray(requestBody.messages)) {
+    requestBody.messages = requestBody.messages.map((msg: any) => {
+      if (msg.role === 'assistant' && msg.reasoning_content) {
+        const { reasoning_content, ...cleanMsg } = msg
+        return cleanMsg
+      }
+      return msg
+    })
+  }
+
   if (!requestBody.max_tokens) {
     requestBody.max_tokens = 32768
   }
@@ -123,7 +135,10 @@ app.all('/v1/*', async (c) => {
       
       if (clientWantsStream) {
         const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
-        
+
+        // Check if client wants reasoning stripped
+        const stripReasoning = requestBody.reasoning_format === 'none'
+
         return new Response(
           new ReadableStream({
             async start(controller) {
@@ -131,31 +146,41 @@ app.all('/v1/*', async (c) => {
               const decoder = new TextDecoder()
               let totalBytes = 0
               let chunkCount = 0
-              
+
               try {
                 while (true) {
                   const { done, value } = await reader.read()
                   if (done) break
-                  
-                  if (needsNormalization) {
+
+                  if (needsNormalization || stripReasoning) {
                     const text = decoder.decode(value, { stream: true })
                     const lines = text.split('\n')
                     const normalizedLines: string[] = []
-                    
+
                     for (const line of lines) {
                       if (line.startsWith('data: ') && !line.includes('[DONE]')) {
                         try {
                           const data = JSON.parse(line.slice(6))
                           const delta = data.choices?.[0]?.delta
-                          if (delta && 'reasoning' in delta) {
-                            delete delta.reasoning
+
+                          if (delta) {
+                            // Strip reasoning field if present
+                            if ('reasoning' in delta) {
+                              delete delta.reasoning
+                            }
+
+                            // Strip <think>...</think> tags from content
+                            if (delta?.content && typeof delta.content === 'string') {
+                              delta.content = delta.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
+                              if (delta.content === '') delta.content = null
+                            }
+
+                            // If stripReasoning, also strip reasoning_content from stream
+                            if (stripReasoning && delta?.reasoning_content) {
+                              delta.reasoning_content = null
+                            }
                           }
-                          // Strip <think>...</think> tags from content field
-                          // stepfun embeds these in content alongside reasoning_content
-                          if (delta?.content && typeof delta.content === 'string') {
-                            delta.content = delta.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-                            if (delta.content === '') delta.content = null
-                          }
+
                           normalizedLines.push('data: ' + JSON.stringify(data))
                         } catch {
                           normalizedLines.push(line)
@@ -208,7 +233,7 @@ app.all('/v1/*', async (c) => {
           const fullSSE = chunks.join('')
           const messages: string[] = []
           const reasoningParts: string[] = []
-          
+
           for (const line of fullSSE.split('\n')) {
             if (line.startsWith('data: ')) {
               const data = line.slice(6).trim()
@@ -228,7 +253,19 @@ app.all('/v1/*', async (c) => {
               }
             }
           }
-          
+
+          // Patch 2: Strip reasoning patterns from content in non-streaming re-assembly
+          let finalContent = messages.join('')
+
+          // Strip **Step X:** patterns and content between them
+          finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
+          // Strip **Conclusion:** patterns
+          finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
+          // Strip any remaining markdown reasoning patterns
+          finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
+          finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
+          finalContent = finalContent.trim()
+
           const finalJson = {
             id: `chatcmpl-${Date.now()}`,
             object: 'chat.completion',
@@ -236,9 +273,9 @@ app.all('/v1/*', async (c) => {
             model: requestBody.model || 'unknown',
             choices: [{
               index: 0,
-              message: { 
-                role: 'assistant', 
-                content: messages.join(''),
+              message: {
+                role: 'assistant',
+                content: finalContent,
                 ...(reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
               },
               finish_reason: 'stop'
