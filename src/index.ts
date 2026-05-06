@@ -20,6 +20,43 @@ let currentKeyIndex = 0
 let totalRequests = 0
 let total429s = 0
 
+/**
+ * Strip embedded reasoning patterns from content string.
+ * Stepfun models emit reasoning as markdown steps inside `content` alongside
+ * the proper `reasoning_content` SSE field — this deduplicates that.
+ *
+ * @param content  - raw re-assembled content string
+ * @param aggressive - when true (reasoning_format=none), strip everything
+ *                     including numbered lists and headers
+ */
+function stripReasoningFromContent(content: string, aggressive = false): string {
+  let out = content
+
+  // **Step X:** blocks — match from **Step to next **Step / **Conclusion / end
+  // Fixed: JS has no \Z anchor; use [\s\S]*$ for "rest of string" in dotall
+  out = out.replace(/\*\*Step\s+\d+:\*\*[\s\S]*?(?=\*\*Step|\*\*Conclusion|$)/gm, '')
+
+  // **Conclusion:** header (keep the text after it)
+  out = out.replace(/\*\*Conclusion:\*\*\s*/g, '')
+
+  // **Reasoning:** / **Thought:** headers
+  out = out.replace(/\*\*Reasoning:\*\*\s*/gi, '')
+  out = out.replace(/\*\*Thought:\*\*\s*/gi, '')
+
+  if (aggressive) {
+    // Strip "Step-by-step reasoning:" headers
+    out = out.replace(/^Step-by-step reasoning:\s*$/gmi, '')
+    // Strip numbered reasoning steps: "1. blah blah" lines (only when they look like reasoning)
+    out = out.replace(/^\s*\d+\.\s+(?:Start|First|Next|Then|Now|Also|Imagine|Begin|Consider|So|Finally|After|Let|We|If|In|The|This|To)\b.*$/gmi, '')
+    // Strip "Reasoning:" at line start
+    out = out.replace(/^Reasoning:\s*.*$/gmi, '')
+  }
+
+  // Clean up excessive whitespace left by stripping
+  out = out.replace(/\n{3,}/g, '\n\n').trim()
+  return out
+}
+
 const app = new Hono()
 
 app.use('*', cors())
@@ -255,34 +292,9 @@ app.all('/v1/*', async (c) => {
           }
 
           // Patch 2: Strip reasoning patterns from content in non-streaming re-assembly
-          let finalContent = messages.join('')
-
-          // Check if client wants reasoning stripped
+          const rawContent = messages.join('')
           const stripReasoningNonStream = requestBody.reasoning_format === 'none'
-
-          if (stripReasoningNonStream) {
-            // When reasoning_format=none, strip ALL reasoning patterns and keep only final answer
-            // Strip numbered steps: "1. ...", "2. ..." (reasoning steps)
-            finalContent = finalContent.replace(/^\s*\d+\.\s+.*$/gm, '')
-            // Strip **Step X:** patterns and content between them
-            finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
-            // Strip **Conclusion:** patterns
-            finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
-            // Strip any remaining markdown reasoning patterns
-            finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
-            finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
-            // Strip "Step-by-step reasoning:" headers
-            finalContent = finalContent.replace(/^Step-by-step reasoning:\s*$/gm, '')
-            // Clean up excessive newlines
-            finalContent = finalContent.replace(/\n{3,}/g, '\n\n').trim()
-          } else {
-            // Default: strip **Step X:** patterns but keep the final answer
-            finalContent = finalContent.replace(/\*\*Step\s+\d+:\*\*.*?(?=\*\*Step|\*\*Conclusion|\Z)/gs, '')
-            finalContent = finalContent.replace(/\*\*Conclusion:\*\*\s*/g, '')
-            finalContent = finalContent.replace(/\*\*Reasoning:\*\*\s*/g, '')
-            finalContent = finalContent.replace(/\*\*Thought:\*\*\s*/g, '')
-            finalContent = finalContent.trim()
-          }
+          const finalContent = stripReasoningFromContent(rawContent, stripReasoningNonStream)
 
           const finalJson = {
             id: `chatcmpl-${Date.now()}`,
