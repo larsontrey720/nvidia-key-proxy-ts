@@ -228,6 +228,15 @@ app.all('/v1/*', async (c) => {
               const decoder = new TextDecoder()
               let totalBytes = 0
               let chunkCount = 0
+              let lastSentTime = Date.now()
+
+              // Heartbeat loop to prevent gateway timeouts
+              const heartbeatId = setInterval(() => {
+                if (Date.now() - lastSentTime > 3000) {
+                  controller.enqueue(encoder.encode(': keep-alive\n\n'))
+                  lastSentTime = Date.now()
+                }
+              }, 3000)
 
               try {
                 while (true) {
@@ -245,52 +254,36 @@ app.all('/v1/*', async (c) => {
                         const delta = data.choices?.[0]?.delta
 
                         if (delta) {
-                          // Remove non-standard 'reasoning' field
-                          if ('reasoning' in delta) {
-                            delete delta.reasoning
+                          // 1. Handle native reasoning_content first
+                          if (delta.reasoning_content) {
+                            const nativeData = JSON.parse(JSON.stringify(data))
+                            nativeData.choices[0].delta.content = null
+                            normalizedLines.push('data: ' + JSON.stringify(nativeData))
                           }
 
-                          const nativeReasoning = delta.reasoning_content
-                          const hasContent = delta.content && typeof delta.content === 'string'
-
-                          if (hasContent && delta.content.includes('<think>')) {
-                            // Content contains <think> tags — normalize them
-                            const parts = normalizer.feed(delta.content)
-                            delta.content = null
-                            delta.reasoning_content = null
-
-                            for (const part of parts) {
-                              const partData = JSON.parse(JSON.stringify(data))
-                              const partDelta = partData.choices[0].delta
-                              partDelta.content = null
-                              partDelta.reasoning_content = null
-                              partDelta[part.field] = part.text
-                              normalizedLines.push('data: ' + JSON.stringify(partData))
-                            }
-                          } else if (hasContent && normalizer) {
-                            // Feed through normalizer even without explicit tags
-                            // (handles partial tags from previous chunks)
-                            const parts = normalizer.feed(delta.content)
-                            if (parts.length > 0 && !(parts.length === 1 && parts[0].field === 'content' && parts[0].text === delta.content)) {
-                              // Normalizer transformed the content
-                              delta.content = null
-                              delta.reasoning_content = null
-
+                          // 2. Handle content and normalize <think> tags
+                          const content = delta.content
+                          if (content && typeof content === 'string') {
+                            const parts = normalizer.feed(content)
+                            
+                            if (parts.length > 0 && (parts.length > 1 || parts[0].field === 'reasoning_content')) {
+                              // Normalizer found thinking blocks - emit them as separate events
                               for (const part of parts) {
                                 const partData = JSON.parse(JSON.stringify(data))
-                                const partDelta = partData.choices[0].delta
-                                partDelta.content = null
-                                partDelta.reasoning_content = null
-                                partDelta[part.field] = part.text
+                                partData.choices[0].delta.content = null
+                                partData.choices[0].delta.reasoning_content = null
+                                partData.choices[0].delta[part.field] = part.text
                                 normalizedLines.push('data: ' + JSON.stringify(partData))
                               }
                             } else {
-                              // No transformation needed — pass through
-                              normalizedLines.push('data: ' + JSON.stringify(data))
+                              // No thinking blocks found, pass original content through (but stripped of native reasoning if we already emitted it)
+                              const contentData = JSON.parse(JSON.stringify(data))
+                              contentData.choices[0].delta.reasoning_content = null
+                              normalizedLines.push('data: ' + JSON.stringify(contentData))
                             }
-                          } else {
-                            // No content or has native reasoning — pass through
-                            normalizedLines.push('data: ' + JSON.stringify(data))
+                          } else if (!delta.reasoning_content) {
+                            // No content and no reasoning - pass through (e.g. finish_reason)
+                            normalizedLines.push(line)
                           }
                         } else {
                           normalizedLines.push(line)
@@ -302,8 +295,12 @@ app.all('/v1/*', async (c) => {
                       normalizedLines.push(line)
                     }
                   }
+                  
                   const normalized = normalizedLines.join('\n')
-                  controller.enqueue(encoder.encode(normalized))
+                  if (normalized) {
+                    controller.enqueue(encoder.encode(normalized + '\n'))
+                    lastSentTime = Date.now()
+                  }
                   totalBytes += normalized.length
                   chunkCount++
                 }
@@ -327,6 +324,7 @@ app.all('/v1/*', async (c) => {
               } catch (e) {
                 console.error(`[PROXY] Stream error: ${e}`)
               } finally {
+                clearInterval(heartbeatId)
                 controller.close()
               }
             }
