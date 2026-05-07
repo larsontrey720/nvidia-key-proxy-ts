@@ -3,9 +3,12 @@
  * 
  * Deployable to: Bun, Cloudflare Workers, Vercel Edge
  *
- * Normalization: some models emit thinking as `<think>` tags inside content,
- * others use the proper `reasoning_content` SSE field. This proxy normalizes
- * both patterns into `reasoning_content` so clients get a consistent format.
+ * Reasoning normalization:
+ * - Some models emit thinking as <think> tags in content (DeepSeek, QwQ)
+ * - Others use the proper reasoning_content SSE field (Stepfun)
+ * - This proxy normalizes both into reasoning_content
+ * - reasoning_content is returned by default (clients like Starchild handle it)
+ * - <think> tags in outgoing assistant messages are preserved for cross-turn coherence
  */
 
 import { Hono } from 'hono'
@@ -24,19 +27,7 @@ let currentKeyIndex = 0
 let totalRequests = 0
 let total429s = 0
 
-/**
- * Extract <think>...</think> blocks from a string.
- * Returns { content, reasoning } with tags removed from content.
- */
-function extractThinkTags(text: string): { content: string; reasoning: string } {
-  const reasoningParts: string[] = []
-  // Extract all <think>...</think> blocks (non-greedy, may span lines)
-  const content = text.replace(/<think>([\s\S]*?)<\/think>/g, (_match, thinkContent) => {
-    reasoningParts.push(thinkContent.trim())
-    return ''
-  }).trim()
-  return { content, reasoning: reasoningParts.join('\n') }
-}
+// ─── Reasoning Normalization ────────────────────────────────────────────────
 
 /**
  * Streaming <think> tag normalizer.
@@ -57,11 +48,9 @@ class ThinkTagNormalizer {
 
     while (this.buffer.length > 0) {
       if (!this.inThink) {
-        // Look for <think> opening tag
         const thinkStart = this.buffer.indexOf('<think>')
         if (thinkStart === -1) {
-          // No think tag — emit all as content (but keep last 7 chars in case of partial tag)
-          // "<think>" is 7 chars, so a chunk ending mid-tag is possible
+          // No think tag — emit all as content (keep last 7 chars in case of partial tag)
           const safeLen = Math.max(0, this.buffer.length - 7)
           if (safeLen > 0) {
             results.push({ field: 'content', text: this.buffer.slice(0, safeLen) })
@@ -69,7 +58,6 @@ class ThinkTagNormalizer {
           }
           break
         } else {
-          // Emit content before the tag
           if (thinkStart > 0) {
             results.push({ field: 'content', text: this.buffer.slice(0, thinkStart) })
           }
@@ -77,7 +65,6 @@ class ThinkTagNormalizer {
           this.inThink = true
         }
       } else {
-        // Inside <think> — look for </think> closing tag
         const thinkEnd = this.buffer.indexOf('</think>')
         if (thinkEnd === -1) {
           // No close tag yet — emit all as reasoning (keep last 8 chars for partial "</think>")
@@ -88,7 +75,6 @@ class ThinkTagNormalizer {
           }
           break
         } else {
-          // Emit reasoning content before the close tag
           if (thinkEnd > 0) {
             results.push({ field: 'reasoning_content', text: this.buffer.slice(0, thinkEnd) })
           }
@@ -112,6 +98,21 @@ class ThinkTagNormalizer {
     return results
   }
 }
+
+/**
+ * Extract <think>...</think> blocks from a non-streaming string.
+ * Returns { content, reasoning } with tags removed from content.
+ */
+function extractThinkTags(text: string): { content: string; reasoning: string } {
+  const reasoningParts: string[] = []
+  const content = text.replace(/<think>([\s\S]*?)<\/think>/g, (_match, thinkContent) => {
+    reasoningParts.push(thinkContent.trim())
+    return ''
+  }).trim()
+  return { content, reasoning: reasoningParts.join('\n') }
+}
+
+// ─── Hono App ───────────────────────────────────────────────────────────────
 
 const app = new Hono()
 
@@ -140,7 +141,7 @@ app.all('/v1/*', async (c) => {
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
 
-  // Pass reasoning_content through to NVIDIA in outgoing messages (don't strip it).
+  // Pass reasoning_content and <think> tags through to NVIDIA in outgoing messages.
   // Models benefit from seeing their own chain-of-thought across turns.
 
   if (!requestBody.max_tokens) {
@@ -244,40 +245,51 @@ app.all('/v1/*', async (c) => {
                         const delta = data.choices?.[0]?.delta
 
                         if (delta) {
-                          // Remove non-standard 'reasoning' field (some models emit this)
+                          // Remove non-standard 'reasoning' field
                           if ('reasoning' in delta) {
                             delete delta.reasoning
                           }
 
-                          // Pass through proper reasoning_content from NVIDIA API as-is
-                          // (models like stepfun use this field natively)
                           const nativeReasoning = delta.reasoning_content
+                          const hasContent = delta.content && typeof delta.content === 'string'
 
-                          // Normalize <think> tags from content → reasoning_content
-                          if (delta.content && typeof delta.content === 'string' && delta.content.includes('<think>')) {
+                          if (hasContent && delta.content.includes('<think>')) {
+                            // Content contains <think> tags — normalize them
                             const parts = normalizer.feed(delta.content)
-                            // Replace the content chunk with normalized output
                             delta.content = null
                             delta.reasoning_content = null
 
                             for (const part of parts) {
-                              // Build a new SSE event for each part
                               const partData = JSON.parse(JSON.stringify(data))
                               const partDelta = partData.choices[0].delta
-                              if (part.field === 'content') {
-                                partDelta.content = part.text
-                                partDelta.reasoning_content = null
-                              } else {
-                                partDelta.content = null
-                                partDelta.reasoning_content = part.text
-                              }
+                              partDelta.content = null
+                              partDelta.reasoning_content = null
+                              partDelta[part.field] = part.text
                               normalizedLines.push('data: ' + JSON.stringify(partData))
                             }
-                          } else if (nativeReasoning) {
-                            // Native reasoning_content — pass through unchanged
-                            normalizedLines.push('data: ' + JSON.stringify(data))
+                          } else if (hasContent && normalizer) {
+                            // Feed through normalizer even without explicit tags
+                            // (handles partial tags from previous chunks)
+                            const parts = normalizer.feed(delta.content)
+                            if (parts.length > 0 && !(parts.length === 1 && parts[0].field === 'content' && parts[0].text === delta.content)) {
+                              // Normalizer transformed the content
+                              delta.content = null
+                              delta.reasoning_content = null
+
+                              for (const part of parts) {
+                                const partData = JSON.parse(JSON.stringify(data))
+                                const partDelta = partData.choices[0].delta
+                                partDelta.content = null
+                                partDelta.reasoning_content = null
+                                partDelta[part.field] = part.text
+                                normalizedLines.push('data: ' + JSON.stringify(partData))
+                              }
+                            } else {
+                              // No transformation needed — pass through
+                              normalizedLines.push('data: ' + JSON.stringify(data))
+                            }
                           } else {
-                            // Regular content chunk — pass through
+                            // No content or has native reasoning — pass through
                             normalizedLines.push('data: ' + JSON.stringify(data))
                           }
                         } else {
