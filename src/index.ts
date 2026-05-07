@@ -1,16 +1,11 @@
 /**
- * Determine whether to include reasoning_content in the response.
- * Default: OFF (most clients don't know this field and mangle it into content).
- * Opt-in: client passes `reasoning_format: "raw"` to receive it.
- */
-function clientWantsReasoning(body: any): boolean {
-  return body.reasoning_format === 'raw'
-}
-
-/**
  * Nvidia API Key Rotation Proxy - TypeScript/Hono
  * 
  * Deployable to: Bun, Cloudflare Workers, Vercel Edge
+ *
+ * Normalization: some models emit thinking as `<think>` tags inside content,
+ * others use the proper `reasoning_content` SSE field. This proxy normalizes
+ * both patterns into `reasoning_content` so clients get a consistent format.
  */
 
 import { Hono } from 'hono'
@@ -30,40 +25,92 @@ let totalRequests = 0
 let total429s = 0
 
 /**
- * Strip embedded reasoning patterns from content string.
- * Stepfun models emit reasoning as markdown steps inside `content` alongside
- * the proper `reasoning_content` SSE field — this deduplicates that.
- *
- * @param content  - raw re-assembled content string
- * @param aggressive - when true (reasoning_format=none), strip everything
- *                     including numbered lists and headers
+ * Extract <think>...</think> blocks from a string.
+ * Returns { content, reasoning } with tags removed from content.
  */
-function stripReasoningFromContent(content: string, aggressive = false): string {
-  let out = content
+function extractThinkTags(text: string): { content: string; reasoning: string } {
+  const reasoningParts: string[] = []
+  // Extract all <think>...</think> blocks (non-greedy, may span lines)
+  const content = text.replace(/<think>([\s\S]*?)<\/think>/g, (_match, thinkContent) => {
+    reasoningParts.push(thinkContent.trim())
+    return ''
+  }).trim()
+  return { content, reasoning: reasoningParts.join('\n') }
+}
 
-  // **Step X:** blocks — match from **Step to next **Step / **Conclusion / end
-  // Fixed: JS has no \Z anchor; use [\s\S]*$ for "rest of string" in dotall
-  out = out.replace(/\*\*Step\s+\d+:\*\*[\s\S]*?(?=\*\*Step|\*\*Conclusion|$)/gm, '')
+/**
+ * Streaming <think> tag normalizer.
+ * Maintains state across chunks since tags can be split across SSE events.
+ * Routes content to content deltas and thinking to reasoning_content deltas.
+ */
+class ThinkTagNormalizer {
+  private buffer = ''
+  private inThink = false
 
-  // **Conclusion:** header (keep the text after it)
-  out = out.replace(/\*\*Conclusion:\*\*\s*/g, '')
+  /**
+   * Feed a content chunk. Returns an array of { field, text } to emit.
+   * field is 'content' or 'reasoning_content'.
+   */
+  feed(chunk: string): Array<{ field: 'content' | 'reasoning_content'; text: string }> {
+    const results: Array<{ field: 'content' | 'reasoning_content'; text: string }> = []
+    this.buffer += chunk
 
-  // **Reasoning:** / **Thought:** headers
-  out = out.replace(/\*\*Reasoning:\*\*\s*/gi, '')
-  out = out.replace(/\*\*Thought:\*\*\s*/gi, '')
+    while (this.buffer.length > 0) {
+      if (!this.inThink) {
+        // Look for <think> opening tag
+        const thinkStart = this.buffer.indexOf('<think>')
+        if (thinkStart === -1) {
+          // No think tag — emit all as content (but keep last 7 chars in case of partial tag)
+          // "<think>" is 7 chars, so a chunk ending mid-tag is possible
+          const safeLen = Math.max(0, this.buffer.length - 7)
+          if (safeLen > 0) {
+            results.push({ field: 'content', text: this.buffer.slice(0, safeLen) })
+            this.buffer = this.buffer.slice(safeLen)
+          }
+          break
+        } else {
+          // Emit content before the tag
+          if (thinkStart > 0) {
+            results.push({ field: 'content', text: this.buffer.slice(0, thinkStart) })
+          }
+          this.buffer = this.buffer.slice(thinkStart + 7) // skip "<think>"
+          this.inThink = true
+        }
+      } else {
+        // Inside <think> — look for </think> closing tag
+        const thinkEnd = this.buffer.indexOf('</think>')
+        if (thinkEnd === -1) {
+          // No close tag yet — emit all as reasoning (keep last 8 chars for partial "</think>")
+          const safeLen = Math.max(0, this.buffer.length - 8)
+          if (safeLen > 0) {
+            results.push({ field: 'reasoning_content', text: this.buffer.slice(0, safeLen) })
+            this.buffer = this.buffer.slice(safeLen)
+          }
+          break
+        } else {
+          // Emit reasoning content before the close tag
+          if (thinkEnd > 0) {
+            results.push({ field: 'reasoning_content', text: this.buffer.slice(0, thinkEnd) })
+          }
+          this.buffer = this.buffer.slice(thinkEnd + 8) // skip "</think>"
+          this.inThink = false
+        }
+      }
+    }
 
-  if (aggressive) {
-    // Strip "Step-by-step reasoning:" headers
-    out = out.replace(/^Step-by-step reasoning:\s*$/gmi, '')
-    // Strip numbered reasoning steps: "1. blah blah" lines (only when they look like reasoning)
-    out = out.replace(/^\s*\d+\.\s+(?:Start|First|Next|Then|Now|Also|Imagine|Begin|Consider|So|Finally|After|Let|We|If|In|The|This|To)\b.*$/gmi, '')
-    // Strip "Reasoning:" at line start
-    out = out.replace(/^Reasoning:\s*.*$/gmi, '')
+    return results
   }
 
-  // Clean up excessive whitespace left by stripping
-  out = out.replace(/\n{3,}/g, '\n\n').trim()
-  return out
+  /** Flush any remaining buffer at stream end */
+  flush(): Array<{ field: 'content' | 'reasoning_content'; text: string }> {
+    const results: Array<{ field: 'content' | 'reasoning_content'; text: string }> = []
+    if (this.buffer.length > 0) {
+      results.push({ field: this.inThink ? 'reasoning_content' : 'content', text: this.buffer })
+      this.buffer = ''
+      this.inThink = false
+    }
+    return results
+  }
 }
 
 const app = new Hono()
@@ -93,17 +140,8 @@ app.all('/v1/*', async (c) => {
   const rawBody = method !== 'GET' ? await c.req.arrayBuffer() : undefined
   const requestBody = rawBody ? JSON.parse(new TextDecoder().decode(rawBody)) : {}
 
-  // Patch 1: Strip reasoning_content from assistant messages before forwarding
-  // This prevents reasoning leakage across turns
-  if (requestBody.messages && Array.isArray(requestBody.messages)) {
-    requestBody.messages = requestBody.messages.map((msg: any) => {
-      if (msg.role === 'assistant' && msg.reasoning_content) {
-        const { reasoning_content, ...cleanMsg } = msg
-        return cleanMsg
-      }
-      return msg
-    })
-  }
+  // Pass reasoning_content through to NVIDIA in outgoing messages (don't strip it).
+  // Models benefit from seeing their own chain-of-thought across turns.
 
   if (!requestBody.max_tokens) {
     requestBody.max_tokens = 32768
@@ -180,10 +218,7 @@ app.all('/v1/*', async (c) => {
       if (!reader) return c.text('No body', 500)
       
       if (clientWantsStream) {
-        const needsNormalization = requestBody.model?.includes('stepfun') || requestBody.model?.includes('step-3.5')
-
-        // Check if client explicitly wants reasoning_content in response
-        const includeReasoning = clientWantsReasoning(requestBody)
+        const normalizer = new ThinkTagNormalizer()
 
         return new Response(
           new ReadableStream({
@@ -198,53 +233,84 @@ app.all('/v1/*', async (c) => {
                   const { done, value } = await reader.read()
                   if (done) break
 
-                  if (needsNormalization || !includeReasoning) {
-                    const text = decoder.decode(value, { stream: true })
-                    const lines = text.split('\n')
-                    const normalizedLines: string[] = []
+                  const text = decoder.decode(value, { stream: true })
+                  const lines = text.split('\n')
+                  const normalizedLines: string[] = []
 
-                    for (const line of lines) {
-                      if (line.startsWith('data: ') && !line.includes('[DONE]')) {
-                        try {
-                          const data = JSON.parse(line.slice(6))
-                          const delta = data.choices?.[0]?.delta
+                  for (const line of lines) {
+                    if (line.startsWith('data: ') && !line.includes('[DONE]')) {
+                      try {
+                        const data = JSON.parse(line.slice(6))
+                        const delta = data.choices?.[0]?.delta
 
-                          if (delta) {
-                            // Strip reasoning field if present
-                            if ('reasoning' in delta) {
-                              delete delta.reasoning
-                            }
-
-                            // Strip <think>...</think> tags from content
-                            if (delta?.content && typeof delta.content === 'string') {
-                              delta.content = delta.content.replace(/<think>[\s\S]*?<\/think>/g, '').trim()
-                              if (delta.content === '') delta.content = null
-                            }
-
-                            // Strip reasoning_content from stream by default
-                            // Only pass through when client opts in with reasoning_format: "raw"
-                            if (!includeReasoning && delta?.reasoning_content) {
-                              delta.reasoning_content = null
-                            }
+                        if (delta) {
+                          // Remove non-standard 'reasoning' field (some models emit this)
+                          if ('reasoning' in delta) {
+                            delete delta.reasoning
                           }
 
-                          normalizedLines.push('data: ' + JSON.stringify(data))
-                        } catch {
+                          // Pass through proper reasoning_content from NVIDIA API as-is
+                          // (models like stepfun use this field natively)
+                          const nativeReasoning = delta.reasoning_content
+
+                          // Normalize <think> tags from content → reasoning_content
+                          if (delta.content && typeof delta.content === 'string' && delta.content.includes('<think>')) {
+                            const parts = normalizer.feed(delta.content)
+                            // Replace the content chunk with normalized output
+                            delta.content = null
+                            delta.reasoning_content = null
+
+                            for (const part of parts) {
+                              // Build a new SSE event for each part
+                              const partData = JSON.parse(JSON.stringify(data))
+                              const partDelta = partData.choices[0].delta
+                              if (part.field === 'content') {
+                                partDelta.content = part.text
+                                partDelta.reasoning_content = null
+                              } else {
+                                partDelta.content = null
+                                partDelta.reasoning_content = part.text
+                              }
+                              normalizedLines.push('data: ' + JSON.stringify(partData))
+                            }
+                          } else if (nativeReasoning) {
+                            // Native reasoning_content — pass through unchanged
+                            normalizedLines.push('data: ' + JSON.stringify(data))
+                          } else {
+                            // Regular content chunk — pass through
+                            normalizedLines.push('data: ' + JSON.stringify(data))
+                          }
+                        } else {
                           normalizedLines.push(line)
                         }
-                      } else {
+                      } catch {
                         normalizedLines.push(line)
                       }
+                    } else {
+                      normalizedLines.push(line)
                     }
-                    const normalized = normalizedLines.join('\n')
-                    controller.enqueue(encoder.encode(normalized))
-                    totalBytes += normalized.length
-                  } else {
-                    controller.enqueue(value)
-                    totalBytes += value.length
                   }
+                  const normalized = normalizedLines.join('\n')
+                  controller.enqueue(encoder.encode(normalized))
+                  totalBytes += normalized.length
                   chunkCount++
                 }
+
+                // Flush normalizer at stream end
+                const remaining = normalizer.flush()
+                if (remaining.length > 0) {
+                  for (const part of remaining) {
+                    const flushEvent = JSON.stringify({
+                      id: `chatcmpl-flush-${Date.now()}`,
+                      object: 'chat.completion.chunk',
+                      created: Math.floor(Date.now() / 1000),
+                      model: requestBody.model || 'unknown',
+                      choices: [{ index: 0, delta: { content: null, reasoning_content: null, [part.field]: part.text }, finish_reason: null }]
+                    })
+                    controller.enqueue(encoder.encode(`data: ${flushEvent}\n`))
+                  }
+                }
+
                 console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, ${chunkCount} chunks, ${totalBytes} bytes)`)
               } catch (e) {
                 console.error(`[PROXY] Stream error: ${e}`)
@@ -278,7 +344,7 @@ app.all('/v1/*', async (c) => {
           }
           
           const fullSSE = chunks.join('')
-          const messages: string[] = []
+          const contentParts: string[] = []
           const reasoningParts: string[] = []
 
           for (const line of fullSSE.split('\n')) {
@@ -290,8 +356,9 @@ app.all('/v1/*', async (c) => {
                 const delta = parsed.choices?.[0]?.delta
                 if (delta) {
                   if (delta.content) {
-                    messages.push(delta.content)
-                  } else if (delta.reasoning_content) {
+                    contentParts.push(delta.content)
+                  }
+                  if (delta.reasoning_content) {
                     reasoningParts.push(delta.reasoning_content)
                   }
                 }
@@ -301,12 +368,14 @@ app.all('/v1/*', async (c) => {
             }
           }
 
-          // Patch 2: Strip reasoning patterns from content in non-streaming re-assembly
-          const rawContent = messages.join('')
-          const includeReasoningNonStream = clientWantsReasoning(requestBody)
-          const finalContent = stripReasoningFromContent(rawContent, !includeReasoningNonStream)
+          // Assemble raw content and extract any <think> tags
+          const rawContent = contentParts.join('')
+          const { content: cleanContent, reasoning: thinkReasoning } = extractThinkTags(rawContent)
 
-          const finalJson = {
+          // Combine: reasoning from <think> tags + reasoning from reasoning_content field
+          const allReasoning = [thinkReasoning, ...reasoningParts].filter(r => r.length > 0).join('\n')
+
+          const finalJson: any = {
             id: `chatcmpl-${Date.now()}`,
             object: 'chat.completion',
             created: Math.floor(Date.now() / 1000),
@@ -315,12 +384,16 @@ app.all('/v1/*', async (c) => {
               index: 0,
               message: {
                 role: 'assistant',
-                content: finalContent,
-                ...(includeReasoningNonStream && reasoningParts.length > 0 && { reasoning_content: reasoningParts.join('') })
+                content: cleanContent || rawContent,  // fallback to raw if extraction failed
               },
               finish_reason: 'stop'
             }],
             usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+          }
+
+          // Include reasoning_content if we have any
+          if (allReasoning.length > 0) {
+            finalJson.choices[0].message.reasoning_content = allReasoning
           }
           
           console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, re-assembled ${totalBytes} bytes)`)
