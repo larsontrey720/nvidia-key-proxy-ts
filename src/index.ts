@@ -266,20 +266,12 @@ app.all('/v1/*', async (c) => {
                           if (content && typeof content === 'string') {
                             const parts = normalizer.feed(content)
                             
-                            if (parts.length > 0 && (parts.length > 1 || parts[0].field === 'reasoning_content')) {
-                              // Normalizer found thinking blocks - emit them as separate events
-                              for (const part of parts) {
-                                const partData = JSON.parse(JSON.stringify(data))
-                                partData.choices[0].delta.content = null
-                                partData.choices[0].delta.reasoning_content = null
-                                partData.choices[0].delta[part.field] = part.text
-                                normalizedLines.push('data: ' + JSON.stringify(partData))
-                              }
-                            } else {
-                              // No thinking blocks found, pass original content through (but stripped of native reasoning if we already emitted it)
-                              const contentData = JSON.parse(JSON.stringify(data))
-                              contentData.choices[0].delta.reasoning_content = null
-                              normalizedLines.push('data: ' + JSON.stringify(contentData))
+                            for (const part of parts) {
+                              const partData = JSON.parse(JSON.stringify(data))
+                              partData.choices[0].delta.content = null
+                              partData.choices[0].delta.reasoning_content = null
+                              partData.choices[0].delta[part.field] = part.text
+                              normalizedLines.push('data: ' + JSON.stringify(partData))
                             }
                           } else if (!delta.reasoning_content) {
                             // No content and no reasoning - pass through (e.g. finish_reason)
@@ -394,7 +386,7 @@ app.all('/v1/*', async (c) => {
               index: 0,
               message: {
                 role: 'assistant',
-                content: cleanContent || rawContent,  // fallback to raw if extraction failed
+                content: cleanContent,
               },
               finish_reason: 'stop'
             }],
