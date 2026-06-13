@@ -333,78 +333,123 @@ app.all('/v1/*', async (c) => {
           }
         )
       } else {
-        const chunks: string[] = []
-        const decoder = new TextDecoder()
-        let totalBytes = 0
-        
-        try {
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
-            chunks.push(decoder.decode(value, { stream: true }))
-            totalBytes += value.length
-          }
-          
-          const fullSSE = chunks.join('')
-          const contentParts: string[] = []
-          const reasoningParts: string[] = []
+        // NON-STREAMING PATH (FIXED): SSE wrapper with heartbeats
+        // Previously: buffered silently, gateway killed the connection.
+        // Now: opens an SSE stream with keep-alive heartbeats while buffering,
+        // then emits a single data event with the re-assembled JSON + [DONE].
+        const normalizer = new ThinkTagNormalizer()
 
-          for (const line of fullSSE.split('\n')) {
-            if (line.startsWith('data: ')) {
-              const data = line.slice(6).trim()
-              if (data === '[DONE]') continue
+        return new Response(
+          new ReadableStream({
+            async start(controller) {
+              const encoder = new TextEncoder()
+              const decoder = new TextDecoder()
+              let lastSentTime = Date.now()
+
+              const heartbeatId = setInterval(() => {
+                if (Date.now() - lastSentTime > 3000) {
+                  controller.enqueue(encoder.encode(': keep-alive\n\n'))
+                  lastSentTime = Date.now()
+                }
+              }, 3000)
+
               try {
-                const parsed = JSON.parse(data)
-                const delta = parsed.choices?.[0]?.delta
-                if (delta) {
-                  if (delta.content) {
-                    contentParts.push(delta.content)
-                  }
-                  if (delta.reasoning_content) {
-                    reasoningParts.push(delta.reasoning_content)
+                const contentParts: string[] = []
+                const reasoningParts: string[] = []
+                let totalBytes = 0
+                let chunkCount = 0
+
+                while (true) {
+                  const { done, value } = await reader.read()
+                  if (done) break
+                  totalBytes += value.length
+                  chunkCount++
+
+                  const text = decoder.decode(value, { stream: true })
+                  for (const line of text.split('\n')) {
+                    if (line.startsWith('data: ')) {
+                      const data = line.slice(6).trim()
+                      if (data === '[DONE]') continue
+                      try {
+                        const parsed = JSON.parse(data)
+                        const delta = parsed.choices?.[0]?.delta
+                        if (delta) {
+                          if (delta.content) {
+                            const parts = normalizer.feed(delta.content)
+                            for (const part of parts) {
+                              if (part.field === 'content') contentParts.push(part.text)
+                              else reasoningParts.push(part.text)
+                            }
+                          }
+                          if (delta.reasoning_content) {
+                            reasoningParts.push(delta.reasoning_content)
+                          }
+                        }
+                      } catch {
+                        // Skip malformed lines
+                      }
+                    }
                   }
                 }
-              } catch {
-                // Skip malformed lines
+
+                // Flush normalizer
+                const remaining = normalizer.flush()
+                for (const part of remaining) {
+                  if (part.field === 'content') contentParts.push(part.text)
+                  else reasoningParts.push(part.text)
+                }
+
+                // Assemble final JSON
+                const rawContent = contentParts.join('')
+                const { content: cleanContent, reasoning: thinkReasoning } = extractThinkTags(rawContent)
+                const allReasoning = [thinkReasoning, ...reasoningParts].filter(r => r.length > 0).join('\n')
+
+                const finalJson: any = {
+                  id: `chatcmpl-${Date.now()}`,
+                  object: 'chat.completion',
+                  created: Math.floor(Date.now() / 1000),
+                  model: requestBody.model || 'unknown',
+                  choices: [{
+                    index: 0,
+                    message: {
+                      role: 'assistant',
+                      content: cleanContent,
+                    },
+                    finish_reason: 'stop'
+                  }],
+                  usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
+                }
+
+                if (allReasoning.length > 0) {
+                  finalJson.choices[0].message.reasoning_content = allReasoning
+                }
+
+                // Emit as single SSE data event + [DONE]
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(finalJson)}\n\n`))
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+                lastSentTime = Date.now()
+
+                console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, re-assembled ${chunkCount} chunks, ${totalBytes} bytes)`)
+              } catch (e) {
+                console.error(`[PROXY] Re-assembly error: ${e}`)
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ error: String(e) })}\n\n`))
+              } finally {
+                clearInterval(heartbeatId)
+                controller.close()
               }
             }
+          }),
+          {
+            status: response.status,
+            headers: {
+              'Content-Type': 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'Connection': 'keep-alive',
+              'X-Accel-Buffering': 'no',
+              'Access-Control-Allow-Origin': '*',
+            }
           }
-
-          // Assemble raw content and extract any <think> tags
-          const rawContent = contentParts.join('')
-          const { content: cleanContent, reasoning: thinkReasoning } = extractThinkTags(rawContent)
-
-          // Combine: reasoning from <think> tags + reasoning from reasoning_content field
-          const allReasoning = [thinkReasoning, ...reasoningParts].filter(r => r.length > 0).join('\n')
-
-          const finalJson: any = {
-            id: `chatcmpl-${Date.now()}`,
-            object: 'chat.completion',
-            created: Math.floor(Date.now() / 1000),
-            model: requestBody.model || 'unknown',
-            choices: [{
-              index: 0,
-              message: {
-                role: 'assistant',
-                content: cleanContent,
-              },
-              finish_reason: 'stop'
-            }],
-            usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 }
-          }
-
-          // Include reasoning_content if we have any
-          if (allReasoning.length > 0) {
-            finalJson.choices[0].message.reasoning_content = allReasoning
-          }
-          
-          console.log(`[PROXY] ← ${response.status} (${Date.now() - startTime}ms, re-assembled ${totalBytes} bytes)`)
-          return c.json(finalJson)
-          
-        } catch (e) {
-          console.error(`[PROXY] Re-assembly error: ${e}`)
-          return c.json({ error: String(e) }, 502)
-        }
+        )
       }
       
     } catch (error) {
